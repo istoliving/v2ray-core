@@ -2,9 +2,8 @@ package router
 
 import (
 	"context"
-	"net"
 
-	v2net "v2ray.com/core/common/net"
+	"v2ray.com/core/common/net"
 )
 
 type Rule struct {
@@ -17,7 +16,7 @@ func (r *Rule) Apply(ctx context.Context) bool {
 }
 
 func cidrToCondition(cidr []*CIDR, source bool) (Condition, error) {
-	ipv4Net := v2net.NewIPNet()
+	ipv4Net := net.NewIPNetTable()
 	ipv6Cond := NewAnyCondition()
 	hasIpv6 := false
 
@@ -33,7 +32,7 @@ func cidrToCondition(cidr []*CIDR, source bool) (Condition, error) {
 			}
 			ipv6Cond.Add(matcher)
 		default:
-			return nil, newError("invalid IP length").AtError()
+			return nil, newError("invalid IP length").AtWarning()
 		}
 	}
 
@@ -53,48 +52,11 @@ func (rr *RoutingRule) BuildCondition() (Condition, error) {
 	conds := NewConditionChan()
 
 	if len(rr.Domain) > 0 {
-		anyCond := NewAnyCondition()
+		matcher := NewCachableDomainMatcher()
 		for _, domain := range rr.Domain {
-			switch domain.Type {
-			case Domain_Plain:
-				anyCond.Add(NewPlainDomainMatcher(domain.Value))
-			case Domain_Regex:
-				matcher, err := NewRegexpDomainMatcher(domain.Value)
-				if err != nil {
-					return nil, err
-				}
-				anyCond.Add(matcher)
-			case Domain_Domain:
-				anyCond.Add(NewSubDomainMatcher(domain.Value))
-			default:
-				panic("Unknown domain type.")
-			}
+			matcher.Add(domain)
 		}
-		conds.Add(anyCond)
-	}
-
-	if len(rr.Cidr) > 0 {
-		cond, err := cidrToCondition(rr.Cidr, false)
-		if err != nil {
-			return nil, err
-		}
-		conds.Add(cond)
-	}
-
-	if rr.PortRange != nil {
-		conds.Add(NewPortMatcher(*rr.PortRange))
-	}
-
-	if rr.NetworkList != nil {
-		conds.Add(NewNetworkMatcher(rr.NetworkList))
-	}
-
-	if len(rr.SourceCidr) > 0 {
-		cond, err := cidrToCondition(rr.SourceCidr, true)
-		if err != nil {
-			return nil, err
-		}
-		conds.Add(cond)
+		conds.Add(matcher)
 	}
 
 	if len(rr.UserEmail) > 0 {
@@ -105,8 +67,32 @@ func (rr *RoutingRule) BuildCondition() (Condition, error) {
 		conds.Add(NewInboundTagMatcher(rr.InboundTag))
 	}
 
+	if rr.PortRange != nil {
+		conds.Add(NewPortMatcher(*rr.PortRange))
+	}
+
+	if rr.NetworkList != nil {
+		conds.Add(NewNetworkMatcher(rr.NetworkList))
+	}
+
+	if len(rr.Cidr) > 0 {
+		cond, err := cidrToCondition(rr.Cidr, false)
+		if err != nil {
+			return nil, err
+		}
+		conds.Add(cond)
+	}
+
+	if len(rr.SourceCidr) > 0 {
+		cond, err := cidrToCondition(rr.SourceCidr, true)
+		if err != nil {
+			return nil, err
+		}
+		conds.Add(cond)
+	}
+
 	if conds.Len() == 0 {
-		return nil, newError("this rule has no effective fields").AtError()
+		return nil, newError("this rule has no effective fields").AtWarning()
 	}
 
 	return conds, nil
