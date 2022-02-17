@@ -1,17 +1,22 @@
+// +build !confonly
+
 package kcp
 
 import (
 	"context"
 	"crypto/cipher"
-	"crypto/tls"
+	gotls "crypto/tls"
 	"sync"
+
+	goxtls "github.com/xtls/go"
 
 	"v2ray.com/core/common"
 	"v2ray.com/core/common/buf"
 	"v2ray.com/core/common/net"
 	"v2ray.com/core/transport/internet"
-	v2tls "v2ray.com/core/transport/internet/tls"
+	"v2ray.com/core/transport/internet/tls"
 	"v2ray.com/core/transport/internet/udp"
+	"v2ray.com/core/transport/internet/xtls"
 )
 
 type ConnectionID struct {
@@ -23,20 +28,19 @@ type ConnectionID struct {
 // Listener defines a server listening for connections
 type Listener struct {
 	sync.Mutex
-	sessions  map[ConnectionID]*Connection
-	hub       *udp.Hub
-	tlsConfig *tls.Config
-	config    *Config
-	reader    PacketReader
-	header    internet.PacketHeader
-	security  cipher.AEAD
-	addConn   internet.ConnHandler
+	sessions   map[ConnectionID]*Connection
+	hub        *udp.Hub
+	tlsConfig  *gotls.Config
+	xtlsConfig *goxtls.Config
+	config     *Config
+	reader     PacketReader
+	header     internet.PacketHeader
+	security   cipher.AEAD
+	addConn    internet.ConnHandler
 }
 
-func NewListener(ctx context.Context, address net.Address, port net.Port, addConn internet.ConnHandler) (*Listener, error) {
-	networkSettings := internet.TransportSettingsFromContext(ctx)
-	kcpSettings := networkSettings.(*Config)
-
+func NewListener(ctx context.Context, address net.Address, port net.Port, streamSettings *internet.MemoryStreamConfig, addConn internet.ConnHandler) (*Listener, error) {
+	kcpSettings := streamSettings.ProtocolSettings.(*Config)
 	header, err := kcpSettings.GetPackerHeader()
 	if err != nil {
 		return nil, newError("failed to create packet header").Base(err).AtError()
@@ -57,11 +61,14 @@ func NewListener(ctx context.Context, address net.Address, port net.Port, addCon
 		addConn:  addConn,
 	}
 
-	if config := v2tls.ConfigFromContext(ctx); config != nil {
+	if config := tls.ConfigFromStreamSettings(streamSettings); config != nil {
 		l.tlsConfig = config.GetTLSConfig()
 	}
+	if config := xtls.ConfigFromStreamSettings(streamSettings); config != nil {
+		l.xtlsConfig = config.GetXTLSConfig()
+	}
 
-	hub, err := udp.ListenUDP(address, port, l.OnReceive, udp.HubCapacity(1024))
+	hub, err := udp.ListenUDP(ctx, address, port, streamSettings, udp.HubCapacity(1024))
 	if err != nil {
 		return nil, err
 	}
@@ -69,22 +76,25 @@ func NewListener(ctx context.Context, address net.Address, port net.Port, addCon
 	l.hub = hub
 	l.Unlock()
 	newError("listening on ", address, ":", port).WriteToLog()
+
+	go l.handlePackets()
+
 	return l, nil
 }
 
-func (l *Listener) OnReceive(payload *buf.Buffer, src net.Destination, originalDest net.Destination) {
+func (l *Listener) handlePackets() {
+	receive := l.hub.Receive()
+	for payload := range receive {
+		l.OnReceive(payload.Payload, payload.Source)
+	}
+}
+
+func (l *Listener) OnReceive(payload *buf.Buffer, src net.Destination) {
 	segments := l.reader.Read(payload.Bytes())
 	payload.Release()
 
 	if len(segments) == 0 {
 		newError("discarding invalid payload from ", src).WriteToLog()
-		return
-	}
-
-	l.Lock()
-	defer l.Unlock()
-
-	if l.hub == nil {
 		return
 	}
 
@@ -96,6 +106,10 @@ func (l *Listener) OnReceive(payload *buf.Buffer, src net.Destination, originalD
 		Port:   src.Port,
 		Conv:   conv,
 	}
+
+	l.Lock()
+	defer l.Unlock()
+
 	conn, found := l.sessions[id]
 
 	if !found {
@@ -124,8 +138,9 @@ func (l *Listener) OnReceive(payload *buf.Buffer, src net.Destination, originalD
 		}, writer, l.config)
 		var netConn internet.Connection = conn
 		if l.tlsConfig != nil {
-			tlsConn := tls.Server(conn, l.tlsConfig)
-			netConn = tlsConn
+			netConn = gotls.Server(conn, l.tlsConfig)
+		} else if l.xtlsConfig != nil {
+			netConn = goxtls.Server(conn, l.xtlsConfig)
 		}
 
 		l.addConn(netConn)
@@ -182,10 +197,10 @@ func (w *Writer) Close() error {
 	return nil
 }
 
-func ListenKCP(ctx context.Context, address net.Address, port net.Port, addConn internet.ConnHandler) (internet.Listener, error) {
-	return NewListener(ctx, address, port, addConn)
+func ListenKCP(ctx context.Context, address net.Address, port net.Port, streamSettings *internet.MemoryStreamConfig, addConn internet.ConnHandler) (internet.Listener, error) {
+	return NewListener(ctx, address, port, streamSettings, addConn)
 }
 
 func init() {
-	common.Must(internet.RegisterTransportListener(internet.TransportProtocol_MKCP, ListenKCP))
+	common.Must(internet.RegisterTransportListener(protocolName, ListenKCP))
 }
